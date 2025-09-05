@@ -24,13 +24,24 @@ ICON_BRAIN = Path("brain_scan.png")
 ICON_AI = Path("ai.png")
 
 # ---------- Config ----------
-MODEL_PATH = os.getenv("MODEL_PATH", "models/stroke_3class.pt")  # future 3-class checkpoint
+MODEL_PATH = os.getenv("MODEL_PATH", "models/stroke_3class.pt")  # 3-class checkpoint when you train
 PAGE_TITLE = "AI Stroke Triage — Oman Prototype"
-
 st.set_page_config(page_title=PAGE_TITLE, page_icon="logo.png", layout="wide")
 
 # ---------- Language toggle ----------
 lang = st.sidebar.selectbox("Language / اللغة", ["English", "العربية"])
+
+# Prob thresholds (sidebar sliders so they’re tunable)
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Triage thresholds**" if lang == "English" else "**عتبات الفرز**")
+HEMORRHAGE_THRESHOLD = st.sidebar.slider(
+    "Hemorrhage alert" if lang == "English" else "تنبيه النزف",
+    min_value=0.30, max_value=0.95, value=0.60, step=0.01
+)
+ISCHEMIC_THRESHOLD = st.sidebar.slider(
+    "Ischemic alert" if lang == "English" else "تنبيه الإقفار",
+    min_value=0.30, max_value=0.95, value=0.60, step=0.01
+)
 
 # 3-class labels (bilingual)
 CLASS_NAMES = {
@@ -48,6 +59,7 @@ TXT = {
         "العربية": "حمّل صورة الأشعة المقطعية للرأس (DICOM/PNG/JPG)",
     },
     "run": {"English": "Run Triage", "العربية": "تشغيل الفرز"},
+    "stop": {"English": "Stop", "العربية": "إيقاف"},
     "note": {
         "English": "Educational demo. Not for clinical use.",
         "العربية": "عرض تعليمي فقط. ليس للاستخدام السريري.",
@@ -57,7 +69,6 @@ TXT = {
         "العربية": "مؤقت الفرز (الهدف ≤ 25 دقيقة)",
     },
     "results": {"English": "AI Findings", "العربية": "نتائج الذكاء الاصطناعي"},
-    "classes": CLASS_NAMES,
 }
 
 # Bilingual developer credit
@@ -67,7 +78,7 @@ dev_text = (
     else "تم تطويره بواسطة <b>أروى الغافرية</b>"
 )
 
-# ---------- Header (logo + title + credit) ----------
+# ---------- Header ----------
 col1, col2 = st.columns([1, 5])
 with col1:
     if LOGO.exists():
@@ -82,119 +93,152 @@ with col2:
 st.caption(TXT["note"][lang])
 st.divider()
 
+# ---------- Timer state & helpers ----------
+if "timer_running" not in st.session_state:
+    st.session_state.timer_running = False
+if "start_time" not in st.session_state:
+    st.session_state.start_time = None
+
+def start_timer():
+    st.session_state.start_time = time.time()
+    st.session_state.timer_running = True
+
+def stop_timer():
+    st.session_state.timer_running = False
+
+def read_timer():
+    if st.session_state.timer_running and st.session_state.start_time:
+        elapsed = time.time() - st.session_state.start_time
+        mm = int(elapsed // 60); ss = int(elapsed % 60)
+        return f"{mm:02d}:{ss:02d}"
+    return "00:00"
+
 # ---------- Model ----------
 @st.cache_resource
-def load_model():
+def load_model(model_path: str):
     model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
     in_f = model.fc.in_features
-    model.fc = nn.Linear(in_f, 3)  # <<< three classes now
+    model.fc = nn.Linear(in_f, 3)  # 3 classes
 
     trained = False
-    if os.path.exists(MODEL_PATH):
+    if os.path.exists(model_path):
         try:
-            state = torch.load(MODEL_PATH, map_location="cpu")
-            # allow loading even if checkpoint head doesn't match exactly
-            model.load_state_dict(state, strict=False)
-            trained = True
+            state = torch.load(model_path, map_location="cpu")
+            try:
+                model.load_state_dict(state, strict=True)  # prefer strict
+                trained = True
+            except RuntimeError:
+                # Fallback: partial load
+                model_dict = model.state_dict()
+                filtered = {k: v for k, v in state.items()
+                            if k in model_dict and v.shape == model_dict[k].shape}
+                model_dict.update(filtered)
+                model.load_state_dict(model_dict, strict=False)
+                st.warning("Checkpoint partially loaded (shape mismatch). Running in partial/DEMO mode.")
+                trained = len(filtered) > 0
         except Exception as e:
-            st.warning(
-                f"Failed to load model weights at {MODEL_PATH}: {e}. "
-                "Using ImageNet weights (DEMO mode)."
-            )
+            st.warning(f"Failed to load weights at {model_path}: {e}. Using ImageNet weights (DEMO).")
     model.eval()
     return model, trained
 
-model, trained = load_model()
+model, trained = load_model(MODEL_PATH)
 
-transform = T.Compose(
-    [
-        T.Resize((256, 256)),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ]
-)
+transform = T.Compose([
+    T.Resize((256, 256)),
+    T.ToTensor(),
+    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
 
-# ---------- UI ----------
-uploaded = st.file_uploader(TXT["upload"][lang], type=["dcm", "png", "jpg", "jpeg"])
+# ---------- File validation & pre-load image ----------
+allowed_ext = {"dcm", "png", "jpg", "jpeg"}
+uploaded = st.file_uploader(TXT["upload"][lang], type=list(allowed_ext))
 
+img_win = None
+if uploaded is not None:
+    ext = uploaded.name.split(".")[-1].lower()
+    if ext not in allowed_ext:
+        st.error("Unsupported file type." if lang == "English" else "نوع ملف غير مدعوم.")
+    else:
+        try:
+            img_gray = load_image_any(uploaded)
+            img_win = apply_brain_window(img_gray)
+        except Exception:
+            st.error("Could not read this file. Please upload a valid head CT DICOM/PNG/JPG."
+                     if lang == "English" else "تعذر قراءة الملف. يرجى تحميل أشعة مقطعية للرأس بصيغة صحيحة.")
+            img_win = None
+
+# ---------- Layout ----------
 left, right = st.columns([2, 1])
 
 with left:
-    if uploaded is not None:
-        img_gray = load_image_any(uploaded)  # HxW uint8
-        img_win = apply_brain_window(img_gray)  # windowed for viewing
-        st.image(img_win, caption="Brain window", use_column_width=True, clamp=True)
+    if img_win is not None:
+        st.image(img_win, caption="Brain window", use_container_width=True, clamp=True)
     else:
-        st.info("Upload a CT image to begin." if lang == "English" else "قم بتحميل صورة الأشعة المقطعية للبدء.")
+        st.info("Upload a CT image to begin."
+                if lang == "English" else "قم بتحميل صورة الأشعة المقطعية للبدء.")
 
 with right:
-    if "start_time" not in st.session_state:
-        st.session_state.start_time = None
-    timer_val = "00:00"
-    if st.session_state.start_time:
-        elapsed = time.time() - st.session_state.start_time
-        mm = int(elapsed // 60)
-        ss = int(elapsed % 60)
-        timer_val = f"{mm:02d}:{ss:02d}"
+    timer_val = read_timer()
     st.metric(TXT["kpi"][lang], value=timer_val, delta="Target ≤ 25 min")
-    start = st.button(TXT["run"][lang], use_container_width=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        start_clicked = st.button(TXT["run"][lang], use_container_width=True)
+    with c2:
+        stop_clicked = st.button(TXT["stop"][lang], use_container_width=True)
+    if start_clicked:
+        start_timer()
+    if stop_clicked:
+        stop_timer()
 
-if uploaded is not None and start:
-    st.session_state.start_time = time.time()
+# ---------- Inference ----------
+if img_win is not None and start_clicked:
+    try:
+        # Prepare tensor
+        rgb = cv2.cvtColor(img_win, cv2.COLOR_GRAY2RGB)
+        pil = Image.fromarray(rgb)
+        x = transform(pil).unsqueeze(0)
 
-    # Prepare tensor
-    rgb = cv2.cvtColor(img_win, cv2.COLOR_GRAY2RGB)
-    pil = Image.fromarray(rgb)
-    x = transform(pil).unsqueeze(0)
+        with torch.no_grad():
+            logits = model(x)
+            if logits.ndim != 2 or logits.shape[1] != 3:
+                raise RuntimeError(f"Unexpected model output shape: {tuple(logits.shape)}")
+            prob = torch.softmax(logits, dim=1)[0].cpu().numpy()  # (3,)
 
-    # Inference (3-class)
-    with torch.no_grad():
-        logits = model(x)
-        prob = torch.softmax(logits, dim=1)[0].cpu().numpy()  # shape (3,)
+        pred_idx = int(prob.argmax())
+        labels = CLASS_NAMES[lang]
+        pred_label = labels[pred_idx]
 
-    pred_idx = int(prob.argmax())
-    labels = CLASS_NAMES[lang]
-    pred_label = labels[pred_idx]
+        # Grad-CAM for the winning class
+        cam = gradcam(model, x, target_class=pred_idx)
+        cam = cv2.resize(cam, (rgb.shape[1], rgb.shape[0]))
+        heat = (cam * 255).astype(np.uint8)
+        heat = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(rgb, 0.6, heat, 0.4, 0)
 
-    # Grad-CAM for the winning class
-    cam = gradcam(model, x, target_class=pred_idx)  # HxW in [0,1]
-    cam = cv2.resize(cam, (rgb.shape[1], rgb.shape[0]))
-    heat = (cam * 255).astype(np.uint8)
-    heat = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
-    overlay = cv2.addWeighted(rgb, 0.6, heat, 0.4, 0)
+        st.subheader(TXT["results"][lang])
+        st.write(f"**{pred_label}**")
+        st.write(f"- {labels[0]}: **{prob[0]:.2f}**")
+        st.write(f"- {labels[1]}: **{prob[1]:.2f}**")
+        st.write(f"- {labels[2]}: **{prob[2]:.2f}**")
 
-    elapsed = time.time() - st.session_state.start_time
-    mm = int(elapsed // 60)
-    ss = int(elapsed % 60)
+        # Triage cues use configurable thresholds
+        if prob[2] >= HEMORRHAGE_THRESHOLD:
+            st.error("High hemorrhage probability — prioritize urgent review."
+                     if lang == "English" else "احتمال مرتفع للنزف — أولوية قصوى للمراجعة.")
+        elif prob[1] >= ISCHEMIC_THRESHOLD:
+            st.warning("Possible ischemic stroke — consider urgent clinical correlation."
+                       if lang == "English" else "سكتة إقفارية محتملة — يُنصح بمراجعة سريرية عاجلة.")
 
-    st.subheader(TXT["results"][lang])
-    st.write(f"**{pred_label}**")
+        st.image(overlay, caption="Attention heatmap (Grad-CAM)", use_container_width=True)
 
-    # Per-class probabilities
-    st.write(
-        f"- {labels[0]}: **{prob[0]:.2f}**\n"
-        f"- {labels[1]}: **{prob[1]:.2f}**\n"
-        f"- {labels[2]}: **{prob[2]:.2f}**"
-    )
-
-    # Simple triage cue
-    if prob[2] >= 0.60:
-        st.error("High hemorrhage probability — prioritize urgent review."
-                 if lang == "English"
-                 else "احتمال مرتفع للنزف — أولوية قصوى للمراجعة.")
-    elif prob[1] >= 0.60:
-        st.warning("Possible ischemic stroke — consider urgent clinical correlation."
-                   if lang == "English"
-                   else "سكتة إقفارية محتملة — يُنصح بمراجعة سريرية عاجلة.")
-
-    st.image(overlay, caption="Attention heatmap (Grad-CAM)", use_column_width=True)
-    st.metric(TXT["kpi"][lang], value=f"{mm:02d}:{ss:02d}", delta="Target ≤ 25 min")
-
-    if not trained:
-        st.warning(
-            "Running in DEMO mode (not trained for 3 classes yet). "
-            "Add a 3-class checkpoint to models/ for realistic performance."
-        )
+    except Exception as e:
+        st.error(("Inference error: " + str(e)) if lang == "English" else ("خطأ في الاستدلال: " + str(e)))
+    finally:
+        # minimal cleanup
+        if 'x' in locals(): del x
+        if 'logits' in locals(): del logits
+        if 'prob' in locals(): del prob
+        import gc; gc.collect()
 
 # ---------- Optional: simple feature rows using your icons ----------
 def feature_row(icon: Path, title_en: str, title_ar: str, desc_en: str, desc_ar: str):
@@ -232,3 +276,4 @@ footer = (
     else "© ٢٠٢٥ تم تطويره بواسطة أروى الغافرية — نموذج تعليمي"
 )
 st.caption(footer)
+
