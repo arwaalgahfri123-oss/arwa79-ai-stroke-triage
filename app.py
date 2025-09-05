@@ -31,17 +31,19 @@ st.set_page_config(page_title=PAGE_TITLE, page_icon="logo.png", layout="wide")
 # ---------- Language toggle ----------
 lang = st.sidebar.selectbox("Language / اللغة", ["English", "العربية"])
 
-# Prob thresholds (sidebar sliders so they’re tunable)
+# Prob thresholds (sidebar sliders so they’re tunable & persistent)
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Triage thresholds**" if lang == "English" else "**عتبات الفرز**")
 HEMORRHAGE_THRESHOLD = st.sidebar.slider(
     "Hemorrhage alert" if lang == "English" else "تنبيه النزف",
-    min_value=0.30, max_value=0.95, value=0.60, step=0.01
+    min_value=0.30, max_value=0.95, value=st.session_state.get("HEM_THR", 0.60), step=0.01
 )
 ISCHEMIC_THRESHOLD = st.sidebar.slider(
     "Ischemic alert" if lang == "English" else "تنبيه الإقفار",
-    min_value=0.30, max_value=0.95, value=0.60, step=0.01
+    min_value=0.30, max_value=0.95, value=st.session_state.get("ISC_THR", 0.60), step=0.01
 )
+st.session_state["HEM_THR"] = HEMORRHAGE_THRESHOLD
+st.session_state["ISC_THR"] = ISCHEMIC_THRESHOLD
 
 # 3-class labels (bilingual)
 CLASS_NAMES = {
@@ -99,23 +101,32 @@ if "timer_running" not in st.session_state:
 if "start_time" not in st.session_state:
     st.session_state.start_time = None
 
-def start_timer():
+def start_timer() -> None:
+    """Begin counting elapsed triage time."""
     st.session_state.start_time = time.time()
     st.session_state.timer_running = True
 
-def stop_timer():
+def stop_timer() -> None:
+    """Halt the triage timer."""
     st.session_state.timer_running = False
 
-def read_timer():
+def read_timer() -> str:
+    """Return the elapsed timer value as MM:SS."""
     if st.session_state.timer_running and st.session_state.start_time:
         elapsed = time.time() - st.session_state.start_time
-        mm = int(elapsed // 60); ss = int(elapsed % 60)
+        mm = int(elapsed // 60)
+        ss = int(elapsed % 60)
         return f"{mm:02d}:{ss:02d}"
     return "00:00"
 
 # ---------- Model ----------
 @st.cache_resource
-def load_model(model_path: str):
+def load_model(model_path: str) -> tuple[nn.Module, bool, torch.device]:
+    """Load ResNet18 weights and move to the best available device.
+
+    Returns (model, trained_flag, device).
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
     in_f = model.fc.in_features
     model.fc = nn.Linear(in_f, 3)  # 3 classes
@@ -138,10 +149,13 @@ def load_model(model_path: str):
                 trained = len(filtered) > 0
         except Exception as e:
             st.warning(f"Failed to load weights at {model_path}: {e}. Using ImageNet weights (DEMO).")
-    model.eval()
-    return model, trained
 
-model, trained = load_model(MODEL_PATH)
+    model.to(device)
+    model.eval()
+    return model, trained, device
+
+model, trained, device = load_model(MODEL_PATH)
+st.sidebar.caption(f"Compute device: {'GPU (CUDA)' if device.type == 'cuda' else 'CPU'}")
 
 transform = T.Compose([
     T.Resize((256, 256)),
@@ -168,6 +182,7 @@ if uploaded is not None:
             img_win = None
 
 # ---------- Layout ----------
+start_clicked = False  # ensure defined even if right column fails early
 left, right = st.columns([2, 1])
 
 with left:
@@ -178,6 +193,10 @@ with left:
                 if lang == "English" else "قم بتحميل صورة الأشعة المقطعية للبدء.")
 
 with right:
+    # DEMO banner if no checkpoint
+    if not trained:
+        st.info("Running in DEMO mode (no 3-class checkpoint found). "
+                "Add models/stroke_3class.pt for realistic performance.")
     timer_val = read_timer()
     st.metric(TXT["kpi"][lang], value=timer_val, delta="Target ≤ 25 min")
     c1, c2 = st.columns(2)
@@ -196,7 +215,7 @@ if img_win is not None and start_clicked:
         # Prepare tensor
         rgb = cv2.cvtColor(img_win, cv2.COLOR_GRAY2RGB)
         pil = Image.fromarray(rgb)
-        x = transform(pil).unsqueeze(0)
+        x = transform(pil).unsqueeze(0).to(device)
 
         with torch.no_grad():
             logits = model(x)
@@ -207,13 +226,6 @@ if img_win is not None and start_clicked:
         pred_idx = int(prob.argmax())
         labels = CLASS_NAMES[lang]
         pred_label = labels[pred_idx]
-
-        # Grad-CAM for the winning class
-        cam = gradcam(model, x, target_class=pred_idx)
-        cam = cv2.resize(cam, (rgb.shape[1], rgb.shape[0]))
-        heat = (cam * 255).astype(np.uint8)
-        heat = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
-        overlay = cv2.addWeighted(rgb, 0.6, heat, 0.4, 0)
 
         st.subheader(TXT["results"][lang])
         st.write(f"**{pred_label}**")
@@ -229,7 +241,16 @@ if img_win is not None and start_clicked:
             st.warning("Possible ischemic stroke — consider urgent clinical correlation."
                        if lang == "English" else "سكتة إقفارية محتملة — يُنصح بمراجعة سريرية عاجلة.")
 
-        st.image(overlay, caption="Attention heatmap (Grad-CAM)", use_container_width=True)
+        # Grad-CAM (guarded)
+        try:
+            cam = gradcam(model, x, target_class=pred_idx)
+            cam = cv2.resize(cam, (rgb.shape[1], rgb.shape[0]))
+            heat = (cam * 255).astype(np.uint8)
+            heat = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
+            overlay = cv2.addWeighted(rgb, 0.6, heat, 0.4, 0)
+            st.image(overlay, caption="Attention heatmap (Grad-CAM)", use_container_width=True)
+        except Exception as e:
+            st.warning(f"Grad-CAM unavailable: {e}")
 
     except Exception as e:
         st.error(("Inference error: " + str(e)) if lang == "English" else ("خطأ في الاستدلال: " + str(e)))
@@ -241,7 +262,8 @@ if img_win is not None and start_clicked:
         import gc; gc.collect()
 
 # ---------- Optional: simple feature rows using your icons ----------
-def feature_row(icon: Path, title_en: str, title_ar: str, desc_en: str, desc_ar: str):
+def feature_row(icon: Path, title_en: str, title_ar: str, desc_en: str, desc_ar: str) -> None:
+    """Display a feature with an accompanying icon in bilingual format."""
     t = title_en if lang == "English" else title_ar
     d = desc_en if lang == "English" else desc_ar
     c1, c2 = st.columns([1, 12])
@@ -276,4 +298,3 @@ footer = (
     else "© ٢٠٢٥ تم تطويره بواسطة أروى الغافرية — نموذج تعليمي"
 )
 st.caption(footer)
-
