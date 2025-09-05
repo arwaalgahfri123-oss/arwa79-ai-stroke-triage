@@ -78,7 +78,7 @@ dev_text = ("Developed by <b>Arwa Alghafri</b>"
 col1, col2 = st.columns([1, 5])
 with col1:
     if LOGO.exists():
-        st.image(str(LOGO), width=80)
+        st.image(str(LOGO), width=150)
 with col2:
     st.markdown(
         "<h2 style='margin-bottom:0; color:#3EC8E0;'>AI Stroke Triage — Oman</h2>"
